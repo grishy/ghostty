@@ -1976,7 +1976,7 @@ pub fn manualStyleUpdate(self: *Screen) !void {
             self.cursor.page_pin.node,
             switch (err) {
                 error.OutOfMemory => .{ .styles = page.capacity.styles * 2 },
-                error.NeedsRehash => .{},
+                error.NeedsRehash => .{ .force_clone = true },
             },
         );
 
@@ -2083,7 +2083,7 @@ pub fn startHyperlink(
             // hyperlink set is too full, rehash it
             error.SetNeedsRehash => _ = try self.adjustCapacity(
                 self.cursor.page_pin.node,
-                .{},
+                .{ .force_clone = true },
             ),
         }
 
@@ -8958,7 +8958,7 @@ test "Screen: adjustCapacity cursor hyperlink exceeds string alloc size" {
     // Adjust the capacity, right now this will cause a redundant copy of
     // the URI to be added to the string alloc, but since there isn't room
     // for this this will clear the cursor hyperlink.
-    _ = try s.adjustCapacity(s.cursor.page_pin.node, .{});
+    _ = try s.adjustCapacity(s.cursor.page_pin.node, .{ .force_clone = true });
 
     // The cursor hyperlink should have been cleared by the `adjustCapacity`
     // call, because there isn't enough room to add the redundant URI string.
@@ -9015,7 +9015,7 @@ test "Screen: adjustCapacity cursor style exceeds style set capacity" {
     // in the same order as the styles were added to begin with, meaning
     // the cursor style will not be able to be added to the set, which
     // should, right now, result in the cursor style being cleared.
-    _ = try s.adjustCapacity(s.cursor.page_pin.node, .{});
+    _ = try s.adjustCapacity(s.cursor.page_pin.node, .{ .force_clone = true });
 
     // The cursor style should have been cleared by the `adjustCapacity`.
     //

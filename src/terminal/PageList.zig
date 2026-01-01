@@ -150,6 +150,10 @@ min_max_size: usize,
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
 
+/// Track maximum grapheme_bytes ever needed.
+/// New pages use this to avoid repeated capacity ramp-up.
+max_grapheme_bytes: usize = std_capacity.grapheme_bytes,
+
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
 
@@ -1327,7 +1331,7 @@ const ReflowCursor = struct {
                         error.OutOfMemory => .{
                             .hyperlink_bytes = cap.hyperlink_bytes * 2,
                         },
-                        error.NeedsRehash => .{},
+                        error.NeedsRehash => .{ .force_clone = true },
                     });
 
                     // We assume this one will succeed. We dupe the link
@@ -1371,7 +1375,7 @@ const ReflowCursor = struct {
                         error.OutOfMemory => .{
                             .styles = cap.styles * 2,
                         },
-                        error.NeedsRehash => .{},
+                        error.NeedsRehash => .{ .force_clone = true },
                     });
 
                     // We assume this one will succeed.
@@ -2475,7 +2479,28 @@ pub fn grow(self: *PageList) !?*List.Node {
         // satisfied then we do not prune.
         if (self.growRequiredForActive()) break :prune;
 
-        const layout = Page.layout(try std_capacity.adjust(.{ .cols = self.cols }));
+        // Compute base capacity for current column count
+        var adjusted_cap = try std_capacity.adjust(.{ .cols = self.cols });
+
+        // Apply high-water mark if it fits in the pooled buffer.
+        // The pruned page buffer is sized for std_size, so we cannot
+        // use a layout that exceeds it (would cause OOB memory access).
+        if (self.max_grapheme_bytes > adjusted_cap.grapheme_bytes) {
+            // If HWM is obviously too large, skip prune entirely.
+            // This lets us allocate a new non-pooled page with proper capacity.
+            if (self.max_grapheme_bytes >= std_size) break :prune;
+
+            var high_cap = adjusted_cap;
+            high_cap.grapheme_bytes = self.max_grapheme_bytes;
+            const high_layout = Page.layout(high_cap);
+            if (high_layout.total_size <= std_size) {
+                adjusted_cap.grapheme_bytes = self.max_grapheme_bytes;
+            } else {
+                // Layout doesn't fit - skip prune to allocate non-pooled page
+                break :prune;
+            }
+        }
+        const layout = Page.layout(adjusted_cap);
 
         // Get our first page and reset it to prepare for reuse.
         const first = self.pages.popFirst().?;
@@ -2568,6 +2593,11 @@ pub const AdjustCapacity = struct {
 
     /// Adjust the number of available string bytes in the page.
     string_bytes: ?usize = null,
+
+    /// Force a clone even if capacity is unchanged. This is used
+    /// when the clone itself is the goal (e.g., for rehashing/compacting
+    /// ref-counted sets like styles or hyperlinks).
+    force_clone: bool = false,
 };
 
 pub const AdjustCapacityError = Allocator.Error || Page.CloneFromError;
@@ -2623,6 +2653,20 @@ pub fn adjustCapacity(
         cap.string_bytes = @max(cap.string_bytes, aligned);
     }
 
+    // Early return if capacity unchanged and clone not forced.
+    // This prevents unnecessary page clones when adjustCapacity is called
+    // when the requested capacity is already satisfied.
+    // Note: force_clone is used when the clone itself is needed for
+    // rehashing/compacting ref-counted sets.
+    if (!adjustment.force_clone and
+        cap.styles == page.capacity.styles and
+        cap.grapheme_bytes == page.capacity.grapheme_bytes and
+        cap.hyperlink_bytes == page.capacity.hyperlink_bytes and
+        cap.string_bytes == page.capacity.string_bytes)
+    {
+        return node;
+    }
+
     log.info("adjusting page capacity={}", .{cap});
 
     // Create our new page and clone the old page into it.
@@ -2647,6 +2691,9 @@ pub fn adjustCapacity(
     self.pages.remove(node);
     self.destroyNode(node);
 
+    // Update high-water mark for future page allocations
+    self.max_grapheme_bytes = @max(self.max_grapheme_bytes, cap.grapheme_bytes);
+
     new_page.assertIntegrity();
     return new_node;
 }
@@ -2657,10 +2704,14 @@ inline fn createPage(
     self: *PageList,
     cap: Capacity,
 ) Allocator.Error!*List.Node {
-    // log.debug("create page cap={}", .{cap});
+    // Use high-water mark for grapheme_bytes to avoid repeated
+    // capacity ramp-up during emoji/grapheme-heavy output.
+    var actual_cap = cap;
+    actual_cap.grapheme_bytes = @max(cap.grapheme_bytes, self.max_grapheme_bytes);
+
     return try createPageExt(
         &self.pool,
-        cap,
+        actual_cap,
         &self.page_serial,
         &self.page_size,
     );
@@ -10925,4 +10976,208 @@ test "PageList resize grow cols with unwrap fixes viewport pin" {
     // Used to panic here, so test that we can get the bottom right.
     const br_after = s.getBottomRight(.viewport);
     try testing.expect(br_after != null);
+}
+
+test "PageList adjustCapacity returns same node when capacity unchanged" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const node = s.pages.first.?;
+    const original_cap = node.data.capacity;
+
+    // Empty adjustment should return same node (no-op)
+    const result = try s.adjustCapacity(node, .{});
+    try testing.expectEqual(node, result);
+    try testing.expectEqual(original_cap.grapheme_bytes, result.data.capacity.grapheme_bytes);
+    try testing.expectEqual(original_cap.styles, result.data.capacity.styles);
+}
+
+test "PageList adjustCapacity updates grapheme high-water mark" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page1 = s.pages.first.?;
+    const initial = page1.data.capacity.grapheme_bytes;
+
+    // Force capacity increase
+    _ = try s.adjustCapacity(page1, .{ .grapheme_bytes = initial * 4 });
+
+    // Verify high-water mark was updated
+    try testing.expectEqual(initial * 4, s.max_grapheme_bytes);
+}
+
+test "PageList grow inherits grapheme high-water mark" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    var page1_node = s.pages.first.?;
+    const initial = page1_node.data.capacity.grapheme_bytes;
+
+    // Increase high-water mark via adjustCapacity
+    // Note: adjustCapacity returns the new node (old one is destroyed)
+    page1_node = try s.adjustCapacity(page1_node, .{ .grapheme_bytes = initial * 4 });
+    try testing.expectEqual(initial * 4, s.max_grapheme_bytes);
+
+    // Fill page1 to capacity to force grow() to allocate new page
+    page1_node.data.pauseIntegrityChecks(true);
+    while (page1_node.data.size.rows < page1_node.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page1_node.data.pauseIntegrityChecks(false);
+
+    // Next grow() should allocate new page
+    const new_node = try s.grow();
+    try testing.expect(new_node != null);
+
+    // Verify new page inherited high-water mark
+    try testing.expectEqual(initial * 4, new_node.?.data.capacity.grapheme_bytes);
+}
+
+test "PageList adjustCapacity force_clone triggers clone" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const node = s.pages.first.?;
+    const original_cap = node.data.capacity;
+
+    // Without force_clone: same node returned
+    const result1 = try s.adjustCapacity(node, .{});
+    try testing.expectEqual(node, result1);
+
+    // With force_clone: different node returned (cloned)
+    const result2 = try s.adjustCapacity(node, .{ .force_clone = true });
+    try testing.expect(result2 != node);
+
+    // But capacity should be same
+    try testing.expectEqual(original_cap.grapheme_bytes, result2.data.capacity.grapheme_bytes);
+    try testing.expectEqual(original_cap.styles, result2.data.capacity.styles);
+}
+
+test "PageList grow with high-water mark set works safely" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Zero forces minimum max size to effectively two pages (triggers pruning)
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page1_node = s.pages.first.?;
+    const base_cap = page1_node.data.capacity.grapheme_bytes;
+
+    // Set a moderate high-water mark
+    s.max_grapheme_bytes = base_cap * 2;
+
+    // Fill page1 to capacity
+    page1_node.data.pauseIntegrityChecks(true);
+    while (page1_node.data.size.rows < page1_node.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page1_node.data.pauseIntegrityChecks(false);
+
+    // Allocate page2
+    const page2_node = try s.grow();
+    try testing.expect(page2_node != null);
+    try testing.expect(s.pages.first != s.pages.last);
+
+    // Fill page2 to force pruning condition
+    const page2 = page2_node.?;
+    page2.data.pauseIntegrityChecks(true);
+    while (page2.data.size.rows < page2.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page2.data.pauseIntegrityChecks(false);
+
+    // This grow should either prune (if HWM layout fits) or allocate fresh
+    // Either way it should NOT crash
+    const new_page = try s.grow();
+    try testing.expect(new_page != null);
+
+    // The new page should have valid capacity (at least base)
+    try testing.expect(new_page.?.data.capacity.grapheme_bytes >= base_cap);
+}
+
+test "PageList grow skips prune when high-water mark too large" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Zero forces minimum max size to effectively two pages (triggers pruning)
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page1_node = s.pages.first.?;
+    const base_cap = page1_node.data.capacity.grapheme_bytes;
+
+    // Fill page1 to capacity
+    page1_node.data.pauseIntegrityChecks(true);
+    while (page1_node.data.size.rows < page1_node.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page1_node.data.pauseIntegrityChecks(false);
+
+    // Allocate page2
+    const page2_node = try s.grow();
+    try testing.expect(page2_node != null);
+
+    // Fill page2 to force pruning condition
+    const page2 = page2_node.?;
+    page2.data.pauseIntegrityChecks(true);
+    while (page2.data.size.rows < page2.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page2.data.pauseIntegrityChecks(false);
+
+    // Set a high-water mark that's large enough to potentially skip prune
+    // but small enough to not overflow layout calculations
+    const large_hwm = base_cap * 16; // 512 * 16 = 8192 in tests
+    s.max_grapheme_bytes = large_hwm;
+
+    // This grow should skip prune (HWM too large for pooled buffer)
+    // and allocate a fresh page via createPage
+    const new_page = try s.grow();
+    try testing.expect(new_page != null);
+
+    // The new page is NOT page1 (prune was skipped, fresh allocation)
+    try testing.expect(new_page.? != page1_node);
+
+    // The new page should have the HWM applied (via createPage)
+    try testing.expect(new_page.?.data.capacity.grapheme_bytes >= base_cap);
+}
+
+test "PageList createPage applies high-water mark" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page1 = s.pages.first.?;
+    const initial = page1.data.capacity.grapheme_bytes;
+
+    // Set high-water mark directly
+    s.max_grapheme_bytes = initial * 8;
+
+    // Create a new page (via grow path that doesn't prune)
+    page1.data.pauseIntegrityChecks(true);
+    while (page1.data.size.rows < page1.data.capacity.rows) {
+        _ = try s.grow();
+    }
+    page1.data.pauseIntegrityChecks(false);
+
+    const new_node = try s.grow();
+    try testing.expect(new_node != null);
+
+    // New page should have high-water mark applied
+    try testing.expectEqual(initial * 8, new_node.?.data.capacity.grapheme_bytes);
 }

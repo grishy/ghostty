@@ -1646,7 +1646,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                             // Rehash the sets
                             error.StyleSetNeedsRehash,
                             error.HyperlinkSetNeedsRehash,
-                            => .{},
+                            => .{ .force_clone = true },
 
                             // Increase style memory
                             error.StyleSetOutOfMemory,
@@ -1849,7 +1849,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                             // Rehash the sets
                             error.StyleSetNeedsRehash,
                             error.HyperlinkSetNeedsRehash,
-                            => .{},
+                            => .{ .force_clone = true },
 
                             // Increase style memory
                             error.StyleSetOutOfMemory,
