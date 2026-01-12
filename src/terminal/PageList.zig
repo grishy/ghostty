@@ -1809,6 +1809,7 @@ fn resizeWithoutReflowGrowCols(
             page.size.rows,
         );
 
+        const prev_page_start_rows = prev_page.size.rows;
         const src_rows = page.rows.ptr(page.memory)[0..len];
         const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_page.size.rows..];
         for (dst_rows, src_rows) |*dst_row, *src_row| {
@@ -1829,6 +1830,16 @@ fn resizeWithoutReflowGrowCols(
 
         assert(copied == len);
         assert(prev_page.size.rows <= prev_page.capacity.rows);
+
+        // Update tracked pins that pointed to rows we just copied to prev page.
+        // Rows [0, copied) from chunk.node are now at [prev_page_start_rows, prev_page.size.rows)
+        // in prev_node.
+        const pin_keys = self.tracked_pins.keys();
+        for (pin_keys) |p| {
+            if (p.node != chunk.node or p.y >= copied) continue;
+            p.node = prev_node;
+            p.y += prev_page_start_rows;
+        }
     }
 
     // We need to loop because our col growth may force us
@@ -11054,4 +11065,79 @@ test "PageList grow reuses non-standard page without leak" {
     try testing.expectEqual(0, tracked_pin.x);
     try testing.expectEqual(0, tracked_pin.y);
     try testing.expect(tracked_pin.garbage);
+}
+
+test "PageList resize (no reflow) more cols remaps pins in prev-fill path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // We need a setup where:
+    // 1. First page exists and will be resized (creating new page with some spare capacity)
+    // 2. Second page exists and will trigger the prev-fill path during resize
+    // 3. A tracked pin on the second page's row 0 (which will be copied to prev page)
+
+    // Start with cols that give us a specific row capacity
+    const initial_cols: size.CellCountInt = 100;
+    const initial_cap = try std_capacity.adjust(.{ .cols = initial_cols });
+
+    // We want to resize to cols that will:
+    // - Force slow path (page.capacity.cols < adjusted cap.cols)
+    // - Result in fewer rows per page (so first page creates a new page with potential spare capacity)
+    const target_cols: size.CellCountInt = 500;
+    const target_cap = try std_capacity.adjust(.{ .cols = target_cols });
+    try testing.expect(target_cap.rows < initial_cap.rows);
+
+    // Create PageList with enough rows to span exactly 1 full page + a few extra rows
+    // This ensures we have 2 pages, with the second page having just a few rows
+    const total_rows = initial_cap.rows + 5; // Full first page + 5 rows in second page
+    var s = try init(alloc, initial_cols, total_rows, null);
+    defer s.deinit();
+
+    // Verify we have 2 pages
+    try testing.expect(s.pages.first != null);
+    try testing.expect(s.pages.first != s.pages.last);
+    const first_node = s.pages.first.?;
+    const second_node = s.pages.last.?;
+    try testing.expect(first_node.next == second_node);
+
+    // Verify first page is full and second page has our extra rows
+    try testing.expectEqual(initial_cap.rows, first_node.data.size.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 5), second_node.data.size.rows);
+
+    // Put some content in the second page's first row to make it identifiable
+    {
+        const rac = second_node.data.getRowAndCell(0, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = 'X' },
+        };
+    }
+
+    // Create a tracked pin at second page, row 0, col 0
+    // This is the row that will be copied to the prev page during resize
+    const pin = try s.trackPin(.{ .node = second_node, .y = 0, .x = 0 });
+    defer s.untrackPin(pin);
+
+    // Verify the pin is valid before resize
+    if (comptime build_options.slow_runtime_safety) {
+        try testing.expect(s.pinIsValid(pin.*));
+    }
+
+    // Resize to larger cols - this will trigger:
+    // 1. First page goes through slow path, creating new page(s)
+    // 2. Second page goes through slow path, and if the new first page has spare capacity,
+    //    the prev-fill path will copy rows from second page to first page
+    // The bug: pins pointing to rows copied in prev-fill path are not remapped
+    try s.resize(.{ .cols = target_cols, .reflow = false });
+
+    // After resize, verify the pin is still valid
+    // This is the assertion that fails without the fix - the pin still points to the
+    // old (now destroyed) second_node
+    if (comptime build_options.slow_runtime_safety) {
+        try testing.expect(s.pinIsValid(pin.*));
+    }
+
+    // Also verify the pin points to the correct content
+    const cell = pin.rowAndCell().cell;
+    try testing.expectEqual(@as(u21, 'X'), cell.content.codepoint);
 }
